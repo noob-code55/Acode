@@ -7,6 +7,7 @@ import anchor from "markdown-it-anchor";
 import MarkdownItGitHubAlerts from "markdown-it-github-alerts";
 import mimeType from "mime-types";
 import mustache from "mustache";
+import path from "path-browserify";
 import browser from "plugins/browser";
 import Url from "utils/Url";
 import helpers from "utils/helpers";
@@ -14,7 +15,8 @@ import $_console from "views/console.hbs";
 import $_markdown from "views/markdown.hbs";
 import constants from "./constants";
 import EditorFile from "./editorFile";
-import openFolder from "./openFolder";
+import EditorManager from "./editorManager";
+import openFolder, { addedFolder } from "./openFolder";
 import appSettings from "./settings";
 
 /**@type {Server} */
@@ -124,17 +126,17 @@ async function run(
 	}
 
 	function startConsole() {
-		runConsole();
-		start();
-	}
-
-	function runConsole() {
 		if (!isConsole) EXECUTING_SCRIPT = activeFile.filename;
 		isConsole = true;
 		target = "inapp";
 		filename = "console.html";
+
+		//this extra www is incorrect because asset_directory itself has www
+		//but keeping it in case something depends on it
 		pathName = `${ASSETS_DIRECTORY}www/`;
 		port = constants.CONSOLE_PORT;
+
+		start();
 	}
 
 	function start() {
@@ -172,12 +174,12 @@ async function run(
 	 * @param {string} req.requestId
 	 * @param {string} req.path
 	 */
-	function handleRequest(req) {
+	async function handleRequest(req) {
 		const reqId = req.requestId;
 		let reqPath = req.path.substring(1);
 
-		if (!reqPath || reqPath.endsWith("/")) {
-			reqPath += "index.html";
+		if (!reqPath || (reqPath.endsWith("/") && reqPath.length === 1)) {
+			reqPath = getRelativePath();
 		}
 
 		const ext = Url.extname(reqPath);
@@ -247,10 +249,35 @@ async function run(
 			}
 
 			let url = activeFile.uri;
+
 			let file = activeFile.SAFMode === "single" ? activeFile : null;
 
 			if (pathName) {
-				url = Url.join(pathName, reqPath);
+				const projectFolder = addedFolder[0];
+
+				//set the root folder to the file parent if no project folder is set
+				let rootFolder = pathName;
+				if (projectFolder !== undefined) {
+					rootFolder = projectFolder.url;
+				}
+				const query = url.split("?")[1];
+
+				//remove the query string if present this is needs to be removed because the url is not valid
+				if (rootFolder.startsWith("ftp:") || rootFolder.startsWith("sftp:")) {
+					if (rootFolder.includes("?")) {
+						rootFolder = rootFolder.split("?")[0];
+					}
+				}
+
+				url = Url.join(rootFolder, reqPath);
+
+				//attach the ftp query string to the url
+				if (query) {
+					url = `${url}?${query}`;
+				}
+
+				console.log("url", url);
+
 				file = editorManager.getFile(url, "uri");
 			} else if (!activeFile.uri) {
 				file = activeFile;
@@ -480,18 +507,193 @@ async function run(
 		});
 	}
 
+	function getRelativePath() {
+		// Get the project url
+		const projectFolder = addedFolder[0];
+
+		// Set the root folder to the file parent if no project folder is set
+		let rootFolder = pathName;
+		if (projectFolder !== undefined) {
+			rootFolder = projectFolder.url;
+		}
+
+		//make the uri absolute if necessary
+		if (
+			rootFolder ===
+			"content://com.termux.documents/tree/%2Fdata%2Fdata%2Fcom.termux%2Ffiles%2Fhome"
+		) {
+			rootFolder =
+				"content://com.termux.documents/tree/%2Fdata%2Fdata%2Fcom.termux%2Ffiles%2Fhome::/data/data/com.termux/files/home/";
+		}
+
+		console.log("rootFolder", rootFolder);
+		console.log("pathName", pathName);
+		console.log("filename", filename);
+
+		// Parent of the file
+		let filePath = pathName;
+
+		if (rootFolder.startsWith("ftp:") || rootFolder.startsWith("sftp:")) {
+			if (rootFolder.includes("?")) {
+				rootFolder = rootFolder.split("?")[0];
+			}
+		}
+
+		//remove the query string if present this is needs to be removed because the url is not valid
+		if (filePath.startsWith("ftp:") || rootFolder.startsWith("sftp:")) {
+			if (filePath.includes("?")) {
+				filePath = filePath.split("?")[0];
+			}
+		}
+
+		// Create full file path
+		let temp = Url.join(filePath, filename);
+
+		// Special handling for Termux URIs
+		if (temp.includes("com.termux.documents") && temp.includes("::")) {
+			try {
+				const [, realPath] = temp.split("::");
+
+				// Determine root folder inside :: path
+				let rootPath = rootFolder;
+				if (rootFolder.includes("::")) {
+					rootPath = rootFolder.split("::")[1];
+				}
+
+				// Normalize both paths to arrays
+				const realParts = realPath.split("/").filter(Boolean);
+				const rootParts = rootPath.split("/").filter(Boolean);
+
+				// Find where the paths start to differ
+				let diffIndex = 0;
+				while (
+					diffIndex < realParts.length &&
+					diffIndex < rootParts.length &&
+					realParts[diffIndex] === rootParts[diffIndex]
+				) {
+					diffIndex++;
+				}
+
+				// Return everything after the common root
+				const relativeParts = realParts.slice(diffIndex);
+				if (relativeParts.length > 0) {
+					return relativeParts.join("/");
+				}
+			} catch (e) {
+				console.error("Error handling Termux URI:", e);
+			}
+		}
+
+		// Handle other content:// URIs
+		if (temp.includes("content://") && temp.includes("::")) {
+			try {
+				// Get the part after :: which contains the actual file path
+				const afterDoubleColon = temp.split("::")[1];
+
+				if (afterDoubleColon) {
+					// Extract the rootFolder's content path if it has ::
+					let rootFolderPath = rootFolder;
+					if (rootFolder.includes("::")) {
+						rootFolderPath = rootFolder.split("::")[1];
+					}
+
+					// If rootFolder doesn't have ::, try to extract the last part of the path
+					if (!rootFolderPath.includes("::")) {
+						const rootParts = rootFolder.split("/");
+						const lastPart = rootParts[rootParts.length - 1];
+
+						// Check if the lastPart is encoded
+						if (lastPart.includes("%3A")) {
+							// Try to decode it
+							try {
+								const decoded = decodeURIComponent(lastPart);
+								rootFolderPath = decoded;
+							} catch (e) {
+								console.error("Error decoding URI component:", e);
+								rootFolderPath = lastPart;
+							}
+						} else {
+							rootFolderPath = lastPart;
+						}
+					}
+
+					// Now find this rootFolderPath in the afterDoubleColon string
+					if (afterDoubleColon.includes(rootFolderPath)) {
+						// Find where to start the relative path
+						const parts = afterDoubleColon.split("/");
+
+						// Find the index of the part that matches or contains rootFolderPath
+						let startIndex = -1;
+						for (let i = 0; i < parts.length; i++) {
+							if (
+								parts[i].includes(rootFolderPath) ||
+								rootFolderPath.includes(parts[i])
+							) {
+								startIndex = i;
+								break;
+							}
+						}
+
+						// If we found a matching part, get everything after it
+						if (startIndex >= 0 && startIndex < parts.length - 1) {
+							return parts.slice(startIndex + 1).join("/");
+						}
+					}
+				}
+			} catch (e) {
+				console.error("Error parsing content URI:", e);
+			}
+		}
+
+		// For regular paths or if content:// URI parsing failed
+		// Try to find a common prefix between rootFolder and temp
+		// and remove it from temp
+		try {
+			const rootParts = rootFolder.split("/");
+			const tempParts = temp.split("/");
+
+			let commonIndex = 0;
+			for (let i = 0; i < Math.min(rootParts.length, tempParts.length); i++) {
+				if (rootParts[i] === tempParts[i]) {
+					commonIndex = i + 1;
+				} else {
+					break;
+				}
+			}
+
+			if (commonIndex > 0) {
+				return tempParts.slice(commonIndex).join("/");
+			}
+		} catch (e) {
+			console.error("Error finding common path:", e);
+		}
+
+		// If all else fails, just return the filename
+		if (filename) {
+			return filename;
+		}
+
+		console.log("Unable to determine relative path, returning full path");
+		return temp;
+	}
+
 	/**
 	 * Opens the preview in browser
 	 */
 	function openBrowser() {
-		console.count("openBrowser");
-		const src = `http://localhost:${port}/${filename}`;
+		let url = "";
+		if (pathName === null && !activeFile.location) {
+			url = `http://localhost:${port}/__unsaved_file__`;
+		} else {
+			url = `http://localhost:${port}/${getRelativePath()}`;
+		}
+
 		if (target === "browser") {
-			system.openInBrowser(src);
+			system.openInBrowser(url);
 			return;
 		}
 
-		browser.open(src, isConsole);
+		browser.open(url, isConsole);
 	}
 }
 
